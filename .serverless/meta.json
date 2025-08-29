@@ -1,0 +1,46 @@
+{
+  "C:\\Users\\Anna\\Desktop\\ndhs-api\\serverless.yml": {
+    "versionFramework": "4.18.2",
+    "servicePath": "C:\\Users\\Anna\\Desktop\\ndhs-api\\serverless.yml",
+    "serviceConfigFileName": "serverless.yml",
+    "service": {
+      "service": "ndhs-api",
+      "provider": {
+        "name": "aws",
+        "runtime": "python3.13",
+        "region": "ap-northeast-2"
+      },
+      "functions": {
+        "api": {
+          "handler": "lambda_handler.handler",
+          "events": [
+            {
+              "httpApi": "*"
+            }
+          ]
+        }
+      },
+      "plugins": [
+        "serverless-python-requirements"
+      ],
+      "custom": {
+        "pythonRequirements": {
+          "dockerizePip": true
+        }
+      }
+    },
+    "provider": {
+      "name": "aws",
+      "runtime": "python3.13",
+      "region": "ap-northeast-2"
+    },
+    "serviceRawFile": "service: ndhs-api\r\n\r\nprovider:\r\n  name: aws\r\n  runtime: python3.13\r\n  region: ap-northeast-2\r\n\r\nfunctions:\r\n  api:\r\n    handler: lambda_handler.handler\r\n    events:\r\n      - httpApi: '*'\r\n\r\nplugins:\r\n  - serverless-python-requirements\r\n\r\ncustom:\r\n  pythonRequirements:\r\n    dockerizePip: true\r\n",
+    "command": [],
+    "options": {},
+    "serviceProviderAwsCfStackId": null,
+    "serviceProviderAwsCfStackCreated": null,
+    "serviceProviderAwsCfStackUpdated": null,
+    "serviceProviderAwsCfStackStatus": null,
+    "serviceProviderAwsCfStackOutputs": null
+  }
+}
