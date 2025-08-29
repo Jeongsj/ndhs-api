@@ -6,10 +6,12 @@ import boto3
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 from flask import Flask, Response
+from flask_cors import CORS
 
 load_dotenv()
 
 app = Flask(__name__)
+CORS(app, origins=["https://www.ndhs.in"])
 
 AWS_ACCESS_KEY_ID = os.getenv("AWS_DYNAMODB_ACCESS_KEY")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_DYNAMODB_ACCESS_SECRET_KEY")
