@@ -19,7 +19,13 @@ functions:
   api:
     handler: lambda_handler.handler
     events:
-      - httpApi: '*'
+      - http:          # REST API 이벤트
+          path: /
+          method: ANY
+      - http:
+          path: /{proxy+}
+          method: ANY
+
 
 plugins:
   - serverless-python-requirements
