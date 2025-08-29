@@ -15,7 +15,7 @@ jobs:
 
     env:
       AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
-      GITHUB_ACTION_ROLE: ${{ secrets.GITHUB_ACTION_ROLE }}
+      GITHUB_ACTION_ROLE: ${{ secrets.AWS_GITHUB_ACTION_ROLE }}
 
     steps:
       - uses: actions/checkout@v4
