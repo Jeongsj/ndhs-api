@@ -30,10 +30,10 @@ custom:
     dockerizePip: true
 
   customDomain:
-    domainName: your.domain.com            # 실제 사용할 Cloudflare에 등록된 도메인 입력
+    domainName: api.ndhs.in
     basePath: ''
-    stage: ${opt:stage, 'dev'}
-    createRoute53Record: false              # Route53 자동 레코드 생성 비활성화
-    endpointType: regional                  # 권장: regional (Cloudflare와 호환성 좋음)
-    certificateName: '*.your.domain.com'   # ACM 인증서 이름 또는 ARN
+    stage: ${opt:stage, 'main'}
+    createRoute53Record: false
+    endpointType: regional
+    certificateName: 'api.ndhs.in'
     autoDomain: true
