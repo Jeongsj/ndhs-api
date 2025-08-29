@@ -1,8 +1,5 @@
-# lambda_handler.py
-import awsgi
+from mangum import Mangum
 
 from app import app
 
-
-def handler(event, context):
-    return awsgi.response(app, event, context)
+handler = Mangum(app)
