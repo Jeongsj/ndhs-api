@@ -8,11 +8,14 @@ provider:
   name: aws
   runtime: python3.13
   region: ap-northeast-2
+  environment:
+    DYNAMODB_TABLE: ndhs-api
+    AWS_ACCOUNT_ID: ${env:AWS_ACCOUNT_ID}
   iamRoleStatements:
     - Effect: Allow
       Action:
         - dynamodb:*
-      Resource: arn:aws:dynamodb:ap-northeast-2:<AWS_ACCOUNT_ID>:table/MyTable
+      Resource: arn:aws:dynamodb:ap-northeast-2:${self:provider.environment.AWS_ACCOUNT_ID}:table/${self:provider.environment.DYNAMODB_TABLE}
 
 functions:
   api:
