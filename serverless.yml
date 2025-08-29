@@ -7,20 +7,13 @@ provider:
   runtime: python3.13
   region: ap-northeast-2
   environment:
-    DYNAMODB_TABLE: ndhs-api
+    DYNAMODB_TABLE: ndhs-notice
     AWS_ACCOUNT_ID: ${env:AWS_ACCOUNT_ID}
   iamRoleStatements:
     - Effect: Allow
       Action:
         - dynamodb:*
       Resource: arn:aws:dynamodb:ap-northeast-2:${self:provider.environment.AWS_ACCOUNT_ID}:table/${self:provider.environment.DYNAMODB_TABLE}
-  httpApi:
-    cors: true
-    domainName:
-      domainName: www.example.com
-      certificateArn: arn:aws:acm:ap-northeast-2:123456789012:certificate/abcdefg
-      endpointType: REGIONAL
-      securityPolicy: TLS_1_2
 
 functions:
   api:
