@@ -2,3 +2,4 @@ flask
 boto3
 mangum
 python-dotenv
+asgiref
