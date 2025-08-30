@@ -8,6 +8,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from google.cloud import firestore
 from google.cloud.firestore_v1.transaction import transactional
+from google.oauth2 import service_account
 
 load_dotenv()
 
@@ -15,11 +16,10 @@ app = Flask(__name__)
 CORS(app, origins=["https://www.ndhs.in"])
 
 
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.getenv(
-    "GOOGLE_APPLICATION_CREDENTIALS_PATH"
-)
-
-db = firestore.Client()
+gcp_cred_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+credentials_info = json.loads(gcp_cred_json)
+credentials = service_account.Credentials.from_service_account_info(credentials_info)
+db = firestore.Client(credentials=credentials)
 
 
 @transactional

@@ -1,6 +1,7 @@
 flask
 flask-cors
-boto3
 mangum
 python-dotenv
 asgiref
+google-cloud-firestore
+google-auth

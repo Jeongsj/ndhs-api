@@ -2,4 +2,3 @@ node_modules/
 legacy/
 .serverless/
 .env
-gcf.json
