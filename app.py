@@ -1,20 +1,19 @@
+import html
 import json
 import os
 import uuid
 from datetime import datetime
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request
+from flask import Flask, Response, request
 from flask_cors import CORS
 from google.cloud import firestore
 from google.cloud.firestore_v1.transaction import transactional
 from google.oauth2 import service_account
 
 load_dotenv()
-
 app = Flask(__name__)
 CORS(app, origins=["https://www.ndhs.in"])
-
 
 gcp_cred_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
 credentials_info = json.loads(gcp_cred_json)
@@ -38,6 +37,33 @@ def increment_post_id_counter(board_id):
     return str(new_post_id)
 
 
+def response_json(data, status=200):
+    # content 필드가 있으면 html.unescape 처리
+    def unescape_content(obj):
+        if isinstance(obj, dict):
+            return {
+                k: (
+                    html.unescape(v)
+                    if k == "content" and isinstance(v, str)
+                    else unescape_content(v)
+                )
+                for k, v in obj.items()
+            }
+        elif isinstance(obj, list):
+            return [unescape_content(i) for i in obj]
+        else:
+            return obj
+
+    data = unescape_content(data)
+    return (
+        Response(
+            json.dumps(data, ensure_ascii=False),
+            content_type="application/json; charset=utf-8",
+        ),
+        status,
+    )
+
+
 # 게시물 작성 API
 @app.route("/boards/<board_id>", methods=["POST"])
 def create_post(board_id):
@@ -47,12 +73,12 @@ def create_post(board_id):
     user_id = (data.get("user_id") or "").strip()
 
     if not all([title, content, user_id]):
-        return jsonify({"error": "Missing required fields"}), 400
+        return response_json({"error": "Missing required fields"}, 400)
 
     if board_id == "notice":
         password = data.get("password") or ""
         if password != os.getenv("NOTICE_PW"):
-            return jsonify({"error": "NOT AUTHROIZED!"}), 403
+            return response_json({"error": "NOT AUTHROIZED!"}, 403)
 
         post_id = str(data.get("post_id"))
         post_data = {
@@ -65,15 +91,12 @@ def create_post(board_id):
             "tag": data.get("tag") or "",
             "no": data.get("no"),
         }
-
     else:
         try:
             post_id = increment_post_id_counter(board_id)
         except Exception as e:
-            return jsonify({"error": str(e)}), 500
-
+            return response_json({"error": str(e)}, 500)
         created_at = datetime.utcnow().isoformat() + "Z"
-
         post_data = {
             "post_id": post_id,
             "board_id": board_id,
@@ -91,9 +114,9 @@ def create_post(board_id):
             .document(post_id)
         )
         post_ref.set(post_data)
-        return jsonify({"message": "Post created", "post_id": post_id}), 201
+        return response_json({"message": "Post created", "post_id": post_id}, 201)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return response_json({"error": str(e)}, 500)
 
 
 # 게시물 목록 조회 API (페이징 포함)
@@ -119,10 +142,9 @@ def get_posts(board_id):
         for doc in docs:
             posts.append({"id": doc.id, **doc.to_dict()})
             last_id = doc.id
-
-        return jsonify({"posts": posts, "last": last_id})
+        return response_json({"posts": posts, "last": last_id})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return response_json({"error": str(e)}, 500)
 
 
 # 게시물 상세 조회 API
@@ -134,11 +156,11 @@ def get_post(board_id, post_id):
     try:
         doc = post_ref.get()
         if doc.exists:
-            return jsonify({"post": doc.to_dict()})
+            return response_json({"posts": [doc.to_dict()]})
         else:
-            return jsonify({"error": "Post not found"}), 404
+            return response_json({"error": "Post not found"}, 404)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return response_json({"error": str(e)}, 500)
 
 
 # 댓글 작성 API
@@ -149,11 +171,10 @@ def add_comment(board_id, post_id):
     user_id = (data.get("user_id") or "").strip()
 
     if not all([content, user_id]):
-        return jsonify({"error": "Missing required field(s)"}), 400
+        return response_json({"error": "Missing required field(s)"}, 400)
 
     comment_id = str(uuid.uuid4())
     created_at = datetime.utcnow().isoformat() + "Z"
-
     comment_data = {
         "comment_id": comment_id,
         "post_id": post_id,
@@ -173,10 +194,11 @@ def add_comment(board_id, post_id):
             .document(comment_id)
         )
         comment_ref.set(comment_data)
-
-        return jsonify({"message": "Comment added", "comment_id": comment_id}), 201
+        return response_json(
+            {"message": "Comment added", "comment_id": comment_id}, 201
+        )
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return response_json({"error": str(e)}, 500)
 
 
 # 댓글 목록 조회 API
@@ -208,10 +230,9 @@ def get_comments(board_id, post_id):
         for doc in docs:
             comments.append(doc.to_dict())
             last_id = doc.id
-
-        return jsonify({"comments": comments, "last_comment_id": last_id})
+        return response_json({"comments": comments, "last_comment_id": last_id})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return response_json({"error": str(e)}, 500)
 
 
 if __name__ == "__main__":
