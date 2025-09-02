@@ -4,4 +4,4 @@ from mangum import Mangum
 from app import app
 
 asgi_app = WsgiToAsgi(app)  # Flask 앱을 ASGI로 감싸기
-handler = Mangum(asgi_app)
+handler = Mangum(asgi_app, lifespan="off")
