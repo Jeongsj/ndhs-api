@@ -247,9 +247,45 @@ def get_comments(board_id, post_id):
 
 
 def update_env_file(key, value, file_path=".env"):
+    """Update environment variable.
+
+    - In local/dev: write to .env and set process env.
+    - In AWS Lambda: use AWS SDK to update the function's environment variables
+      and set process env for immediate use in current invocation.
+    """
+    # If running inside AWS Lambda, update Lambda function configuration
+    if os.getenv("AWS_LAMBDA_FUNCTION_NAME"):
+        try:
+            import boto3  # Available in Lambda runtime
+
+            function_name = os.getenv("LAMBDA_FUNCTION_NAME") or os.getenv(
+                "AWS_LAMBDA_FUNCTION_NAME"
+            )
+            region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
+            client = (
+                boto3.client("lambda", region_name=region)
+                if region
+                else boto3.client("lambda")
+            )
+
+            cfg = client.get_function_configuration(FunctionName=function_name)
+            variables = cfg.get("Environment", {}).get("Variables", {}) or {}
+            variables[key] = value
+            client.update_function_configuration(
+                FunctionName=function_name, Environment={"Variables": variables}
+            )
+            # Reflect in current process env immediately
+            os.environ[key] = value
+            return True
+        except Exception as e:
+            print(f"[WARN] Failed to update Lambda env var: {e}")
+            # Best-effort: update current process env so rest of handler can continue
+            os.environ[key] = value
+            return False
+
+    # Default: local/dev, edit .env file
     key_found = False
     new_lines = []
-    # .env 파일을 줄 단위로 읽고 해당 키가 있으면 값을 업데이트
     if os.path.exists(file_path):
         with open(file_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
@@ -259,11 +295,13 @@ def update_env_file(key, value, file_path=".env"):
                 key_found = True
             else:
                 new_lines.append(line)
-    # 키가 없으면 파일 끝에 추가
     if not key_found:
         new_lines.append(f"{key}={value}\n")
     with open(file_path, "w", encoding="utf-8") as f:
         f.writelines(new_lines)
+    # Also update current process env
+    os.environ[key] = value
+    return True
 
 
 def update_laundry_token():
