@@ -5,3 +5,4 @@ python-dotenv
 asgiref
 google-cloud-firestore
 google-auth
+requests

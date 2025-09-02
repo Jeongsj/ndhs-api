@@ -2,8 +2,9 @@ import html
 import json
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
+import requests
 from dotenv import load_dotenv
 from flask import Flask, Response, request
 from flask_cors import CORS
@@ -13,7 +14,7 @@ from google.oauth2 import service_account
 
 load_dotenv()
 app = Flask(__name__)
-CORS(app, origins=["https://www.ndhs.in"])
+CORS(app, origins=["*"])  # https://www.ndhs.in
 
 gcp_cred_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
 credentials_info = json.loads(gcp_cred_json)
@@ -62,6 +63,17 @@ def response_json(data, status=200):
         ),
         status,
     )
+
+
+def time_diff(time_str):
+    now_utc = datetime.utcnow()
+    now_kst = now_utc + timedelta(hours=9)
+    try:
+        time_dt = datetime.strptime(time_str, "%Y-%m-%dT%H:%M:%S.%f")
+        time_diff = time_dt - now_kst
+    except:
+        return 0
+    return int(time_diff.total_seconds())
 
 
 # 게시물 작성 API
@@ -235,5 +247,141 @@ def get_comments(board_id, post_id):
         return response_json({"error": str(e)}, 500)
 
 
+def update_env_file(key, value, file_path=".env"):
+    key_found = False
+    new_lines = []
+    # .env 파일을 줄 단위로 읽고 해당 키가 있으면 값을 업데이트
+    if os.path.exists(file_path):
+        with open(file_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        for line in lines:
+            if line.startswith(f"{key}="):
+                new_lines.append(f"{key}={value}\n")
+                key_found = True
+            else:
+                new_lines.append(line)
+    # 키가 없으면 파일 끝에 추가
+    if not key_found:
+        new_lines.append(f"{key}={value}\n")
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.writelines(new_lines)
+
+
+def update_laundry_token():
+    refreshToken = os.getenv("LAUNDRY_REFRESH_TOKEN")
+    url = f"{os.getenv('LAUNDRY_API')}/update-access-token"
+    headers = {
+        "User-Agent": os.getenv("LAUNDRY_AGENT"),
+        "referer": f"{os.getenv('LAUNDRY_REFERER')}/",
+        "content-type": "application/json",
+        "origin": os.getenv("LAUNDRY_REFERER"),
+        "Cookie": f"refreshToken={refreshToken}",
+    }
+
+    try:
+        print(f"[DEBUG] request to {url}")
+        resp = requests.post(url, headers=headers, json={"refreshToken": refreshToken})
+        if resp.status_code != 200:
+            return response_json(
+                {
+                    "error": "Update Access-token error",
+                    "status": resp.status_code,
+                    "text": resp.text,
+                },
+                502,
+            )
+        else:
+            token = resp.json().get("data", {}).get("accessToken")
+            if token:
+                update_env_file("LAUNDRY_AUTH", token)
+                os.environ["LAUNDRY_AUTH"] = token
+                return token
+            else:
+                return 1
+    except requests.RequestException as e:
+        return 1
+
+
+# In-memory cache for laundry results (per sex code)
+LAUNDRY_CACHE = {}  # { code: { 'ts': datetime.utcnow(), 'data': [dryers] } }
+
+
+# 건조기 현황 조회 API
+@app.route("/laundry/<sex>", methods=["GET"])
+def get_laundry(sex):
+    s = sex.strip().lower()
+    if s == "m":
+        code = "95"
+    elif s == "f":
+        code = "96"
+    else:
+        return response_json({"error": "Invalid sex. Use male/female"}, 400)
+
+    # Serve from cache if fresh
+    cache_entry = LAUNDRY_CACHE.get(code)
+    if cache_entry:
+        age = (datetime.utcnow() - cache_entry["ts"]).total_seconds()
+        ttl = int(os.getenv("LAUNDRY_CACHE_TTL", 60))
+        if age < ttl:
+            cached = cache_entry["data"] or []
+            # Recompute time_diff to keep it current without hitting upstream
+            dryers = []
+            for d in cached:
+                dd = dict(d)
+                dd["time_diff"] = time_diff(d.get("useEndTime"))
+                dryers.append(dd)
+            return response_json(dryers)
+
+    token = os.getenv("LAUNDRY_AUTH")
+    laundry_api = f"{os.getenv('LAUNDRY_API')}/laundry/new/list"
+    url = f"{laundry_api}/{code}"
+    headers = {
+        "User-Agent": os.getenv("LAUNDRY_AGENT"),
+        "referer": f"{os.getenv('LAUNDRY_REFERER')}/",
+        "content-type": "application/json",
+        "origin": os.getenv("LAUNDRY_REFERER"),
+        "authorization": token,
+    }
+    try:
+        print(f"[DEBUG] request to {url}")
+        resp = requests.get(url, headers=headers, timeout=3)
+        if resp.status_code == 401:  # token expired
+            update_laundry_token()
+            return get_laundry(s)
+        elif resp.status_code != 200:
+            return response_json(
+                {
+                    "error": "Upstream error",
+                    "status": resp.status_code,
+                    "text": resp.text[:300],
+                },
+                502,
+            )
+
+        payload = resp.json()
+        items = payload.get("data", []) if isinstance(payload, dict) else []
+        dryers = []
+        for item in items:
+            if item.get("equipmentTypeCd") != "DRYER":
+                continue
+            dryers.append(
+                {
+                    "equipmentSeq": item.get("equipmentSeq"),
+                    "equipmentName": item.get("equipmentName"),
+                    "equipmentStatusCd": item.get("equipmentStatusCd"),  # USABLE, USE
+                    "equipmentTypeCd": item.get("equipmentTypeCd"),
+                    "useEndTime": item.get(
+                        "useEndTime"
+                    ),  # e.g., 2025-09-01T23:50:02.829 or None
+                    "time_diff": time_diff(item.get("useEndTime")),
+                }
+            )
+        # Cache fresh result
+        LAUNDRY_CACHE[code] = {"ts": datetime.utcnow(), "data": dryers}
+        return response_json(dryers)
+    except requests.RequestException as e:
+        return response_json({"error": "Request failed", "detail": str(e)}, 502)
+
+
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", debug=True)
