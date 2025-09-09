@@ -15,19 +15,9 @@ functions:
           path: /{proxy+}
           method: ANY
 
-
 plugins:
   - serverless-python-requirements
 
 custom:
   pythonRequirements:
     dockerizePip: true
-
-  customDomain:
-    domainName: api.ndhs.in
-    basePath: ''
-    stage: ${opt:stage, 'main'}
-    createRoute53Record: false
-    endpointType: regional
-    certificateName: 'api.ndhs.in'
-    autoDomain: true
