@@ -420,5 +420,11 @@ def get_laundry(sex):
         return response_json({"error": "Request failed", "detail": str(e)}, 502)
 
 
+# 내 정보 조회 fake API
+@app.route("/info/my", methods=["GET"])
+def get_info():
+    return response_json({"outside": True, "room_id": "126"})
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", debug=True)

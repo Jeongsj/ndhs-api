@@ -11,10 +11,7 @@ functions:
   api:
     handler: lambda_handler.handler
     events:
-      - http:          # REST API 이벤트
-          path: /
-          method: ANY
-      - http:
+      - httpApi:
           path: /{proxy+}
           method: ANY
 
