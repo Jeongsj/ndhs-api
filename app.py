@@ -14,7 +14,7 @@ from google.oauth2 import service_account
 
 load_dotenv()
 app = Flask(__name__)
-CORS(app, origins=["https://www.ndhs.in"])
+CORS(app, origins=["https://dev.ndhs.app", "https://ndhs.app"])
 
 cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 credentials = service_account.Credentials.from_service_account_file(cred_path)
