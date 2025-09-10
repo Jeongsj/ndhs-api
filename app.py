@@ -14,7 +14,10 @@ from google.oauth2 import service_account
 
 load_dotenv()
 app = Flask(__name__)
-CORS(app, origins=["https://dev.ndhs.app", "https://ndhs.app"])
+CORS(
+    app,
+    origins=["https://dev.ndhs.app", "https://ndhs.app"],
+)
 
 cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 credentials = service_account.Credentials.from_service_account_file(cred_path)
@@ -82,8 +85,12 @@ def create_post(board_id):
     title = (data.get("title") or "").strip()
     content = (data.get("content") or "").strip()
     user_id = (data.get("user_id") or "").strip()
+    if "X-Forwarded-For" in request.headers:
+        ip = request.headers["X-Forwarded-For"]
+    else:
+        ip = request.remote_addr
 
-    if not all([title, content, user_id]):
+    if not all([title, content]):
         return response_json({"error": "Missing required fields"}, 400)
 
     if board_id == "notice":
@@ -101,6 +108,7 @@ def create_post(board_id):
             "created_at": data.get("created_at"),
             "tag": data.get("tag") or "",
             "no": data.get("no"),
+            "ip": ip,
         }
     else:
         try:
@@ -180,8 +188,12 @@ def add_comment(board_id, post_id):
     data = request.json
     content = (data.get("content") or "").strip()
     user_id = (data.get("user_id") or "").strip()
+    if "X-Forwarded-For" in request.headers:
+        ip = request.headers["X-Forwarded-For"]
+    else:
+        ip = request.remote_addr
 
-    if not all([content, user_id]):
+    if not all([content]):
         return response_json({"error": "Missing required field(s)"}, 400)
 
     comment_id = str(uuid.uuid4())
@@ -193,6 +205,7 @@ def add_comment(board_id, post_id):
         "content": content,
         "user_id": user_id,
         "created_at": created_at,
+        "ip": ip,
     }
 
     try:
