@@ -259,6 +259,62 @@ def get_comments(board_id, post_id):
         return response_json({"error": str(e)}, 500)
 
 
+@transactional
+def apply_like_once(transaction, post_ref, ip):
+    """Transactionally record a like per IP and increment like counter.
+
+    Returns a dict: {status: 'ok'|'already'|'not_found', likes: int|None}
+    """
+    doc = post_ref.get(transaction=transaction)
+    if not doc.exists:
+        return {"status": "not_found", "likes": None}
+
+    like_ref = post_ref.collection("likes").document(ip)
+    like_doc = like_ref.get(transaction=transaction)
+    if like_doc.exists:
+        current_likes = doc.to_dict().get("likes") or 0
+        return {"status": "already", "likes": current_likes}
+
+    # Record like by IP and increment counter atomically
+    transaction.set(
+        like_ref,
+        {"ip": ip, "created_at": datetime.utcnow().isoformat() + "Z"},
+    )
+    transaction.update(post_ref, {"likes": firestore.Increment(1)})
+
+    new_likes = (doc.to_dict().get("likes") or 0) + 1
+    return {"status": "ok", "likes": new_likes}
+
+
+# 게시물 좋아요 API
+@app.route("/boards/<board_id>/<post_id>/like", methods=["POST"])
+def like_post(board_id, post_id):
+    if "X-Forwarded-For" in request.headers:
+        ip = request.headers["X-Forwarded-For"]
+    else:
+        ip = request.remote_addr
+
+    post_ref = (
+        db.collection("boards").document(board_id).collection("posts").document(post_id)
+    )
+
+    try:
+        transaction = db.transaction()
+        result = apply_like_once(transaction, post_ref, ip)
+        if result["status"] == "not_found":
+            return response_json({"error": "Post not found"}, 404)
+
+        return response_json(
+            {
+                "post_id": post_id,
+                "likes": result["likes"],
+                "already_liked": result["status"] == "already",
+            }
+        )
+    except Exception as e:
+        return response_json({"error": str(e)}, 500)
+
+
 def update_env_file(key, value, file_path=".env"):
     """Update environment variable.
 
