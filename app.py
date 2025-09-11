@@ -2,7 +2,7 @@ import html
 import json
 import os
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 from dotenv import load_dotenv
@@ -16,7 +16,7 @@ load_dotenv()
 app = Flask(__name__)
 CORS(
     app,
-    origins=["https://dev.ndhs.app", "https://ndhs.app"],
+    origins=["https://ndhs.app"],
 )
 
 cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
@@ -44,14 +44,14 @@ def response_json(data, status=200):
     # content 필드가 있으면 html.unescape 처리
     def unescape_content(obj):
         if isinstance(obj, dict):
-            return {
-                k: (
-                    html.unescape(v)
-                    if k == "content" and isinstance(v, str)
-                    else unescape_content(v)
-                )
-                for k, v in obj.items()
-            }
+            board_id = obj.get("board_id")
+            new_obj = {}
+            for k, v in obj.items():
+                if k == "content" and isinstance(v, str) and board_id == "notice":
+                    new_obj[k] = html.unescape(v)
+                else:
+                    new_obj[k] = unescape_content(v)
+            return new_obj
         elif isinstance(obj, list):
             return [unescape_content(i) for i in obj]
         else:
@@ -68,11 +68,15 @@ def response_json(data, status=200):
 
 
 def time_diff(time_str):
-    now_utc = datetime.utcnow()
+    # Use timezone-aware UTC then make KST reference
+    now_utc = datetime.now(timezone.utc)
     now_kst = now_utc + timedelta(hours=9)
     try:
+        # Stored times are naive (assumed KST). Parse and treat as KST naive by
+        # comparing against KST naive representation for backward compatibility.
         time_dt = datetime.strptime(time_str, "%Y-%m-%dT%H:%M:%S.%f")
-        time_diff = time_dt - now_kst
+        # Convert aware KST now to naive for consistent subtraction with stored naive times
+        time_diff = time_dt - now_kst.replace(tzinfo=None)
     except:
         return 0
     return int(time_diff.total_seconds())
@@ -115,7 +119,9 @@ def create_post(board_id):
             post_id = increment_post_id_counter(board_id)
         except Exception as e:
             return response_json({"error": str(e)}, 500)
-        created_at = datetime.utcnow().isoformat() + "Z"
+        created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        # Escape user-provided HTML to mitigate XSS for non-notice boards
+        content = html.escape(content)
         post_data = {
             "post_id": post_id,
             "board_id": board_id,
@@ -197,12 +203,14 @@ def add_comment(board_id, post_id):
         return response_json({"error": "Missing required field(s)"}, 400)
 
     comment_id = str(uuid.uuid4())
-    created_at = datetime.utcnow().isoformat() + "Z"
+    created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    # Escape comment content unless on notice board (notice comments may also contain admin HTML)
+    safe_content = content if board_id == "notice" else html.escape(content)
     comment_data = {
         "comment_id": comment_id,
         "post_id": post_id,
         "board_id": board_id,
-        "content": content,
+        "content": safe_content,
         "user_id": user_id,
         "created_at": created_at,
         "ip": ip,
@@ -278,7 +286,10 @@ def apply_like_once(transaction, post_ref, ip):
     # Record like by IP and increment counter atomically
     transaction.set(
         like_ref,
-        {"ip": ip, "created_at": datetime.utcnow().isoformat() + "Z"},
+        {
+            "ip": ip,
+            "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        },
     )
     transaction.update(post_ref, {"likes": firestore.Increment(1)})
 
@@ -426,7 +437,7 @@ def get_laundry(sex):
     # Serve from cache if fresh
     cache_entry = LAUNDRY_CACHE.get(code)
     if cache_entry:
-        age = (datetime.utcnow() - cache_entry["ts"]).total_seconds()
+        age = (datetime.now(timezone.utc) - cache_entry["ts"]).total_seconds()
         ttl = int(os.getenv("LAUNDRY_CACHE_TTL", 60))
         if age < ttl:
             cached = cache_entry["data"] or []
@@ -483,7 +494,7 @@ def get_laundry(sex):
                 }
             )
         # Cache fresh result
-        LAUNDRY_CACHE[code] = {"ts": datetime.utcnow(), "data": dryers}
+        LAUNDRY_CACHE[code] = {"ts": datetime.now(timezone.utc), "data": dryers}
         return response_json(dryers)
     except requests.RequestException as e:
         return response_json({"error": "Request failed", "detail": str(e)}, 502)
