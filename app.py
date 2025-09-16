@@ -160,17 +160,10 @@ def get_posts(board_id):
     last = request.args.get("last")
 
     posts_ref = db.collection("boards").document(board_id).collection("posts")
-    # 공지 이외의 게시판은 승인된 글만 노출
-    if board_id != "notice":
-        query = (
-            posts_ref.where("isAccept", "==", True)
-            .order_by("created_at", direction=firestore.Query.DESCENDING)
-            .limit(limit)
-        )
-    else:
-        query = posts_ref.order_by(
-            "created_at", direction=firestore.Query.DESCENDING
-        ).limit(limit)
+    # 승인 여부와 관계없이 모두 반환(프론트에서 isAccept로 마스킹)
+    query = posts_ref.order_by(
+        "created_at", direction=firestore.Query.DESCENDING
+    ).limit(limit)
 
     if last:
         last_doc = posts_ref.document(last).get()
@@ -199,9 +192,7 @@ def get_post(board_id, post_id):
         doc = post_ref.get()
         if doc.exists:
             data = doc.to_dict()
-            # 공지 외에는 승인된 글만 열람 가능
-            if board_id != "notice" and not data.get("isAccept"):
-                return response_json({"error": "Post not found"}, 404)
+            # 승인 전 글도 반환하고 프론트에서 마스킹 처리
             return response_json({"posts": [data]})
         else:
             return response_json({"error": "Post not found"}, 404)
@@ -266,12 +257,19 @@ def get_comments(board_id, post_id):
         .document(post_id)
         .collection("comments")
     )
-    # 승인된 댓글만 노출
-    query = (
-        comments_ref.where("isAccept", "==", True)
-        .order_by("created_at", direction=firestore.Query.ASCENDING)
-        .limit(limit)
-    )
+    # 빈 컬렉션은 바로 처리 (인덱스 미구성 시에도 안전)
+    try:
+        first_doc = next(comments_ref.limit(1).stream(), None)
+        if first_doc is None:
+            return response_json({"comments": [], "last_comment_id": None})
+    except Exception as e:
+        # 예외적 상황에서도 안전 반환
+        return response_json({"comments": [], "last_comment_id": None})
+
+    # 승인 여부와 관계없이 모두 반환 (프론트에서 마스킹)
+    query = comments_ref.order_by(
+        "created_at", direction=firestore.Query.ASCENDING
+    ).limit(limit)
 
     if last_comment_id:
         last_doc = comments_ref.document(last_comment_id).get()
@@ -287,7 +285,43 @@ def get_comments(board_id, post_id):
             last_id = doc.id
         return response_json({"comments": comments, "last_comment_id": last_id})
     except Exception as e:
-        return response_json({"error": str(e)}, 500)
+        # 인덱스 미구성 등으로 실패한 경우 폴백: 최대 N개 읽어 정렬/슬라이싱
+        err = str(e)
+        try:
+            fallback_limit = max(50, limit * 3)
+            docs = comments_ref.limit(fallback_limit).stream()
+            items = []
+            from datetime import datetime as _dt
+
+            def _parse(ts):
+                try:
+                    # stored as ISO string
+                    return (
+                        _dt.fromisoformat(ts.replace("Z", "+00:00")) if ts else _dt.min
+                    )
+                except Exception:
+                    return _dt.min
+
+            # last cursor 기준시간
+            last_created = None
+            if last_comment_id:
+                last_doc = comments_ref.document(last_comment_id).get()
+                if last_doc.exists:
+                    last_created = _parse(last_doc.to_dict().get("created_at"))
+
+            for d in docs:
+                data = d.to_dict()
+                ctime = _parse(data.get("created_at"))
+                if last_created and not (ctime > last_created):
+                    continue
+                items.append(data)
+
+            items.sort(key=lambda x: _parse(x.get("created_at")))
+            sliced = items[:limit]
+            next_id = None  # 폴백에서는 안전한 커서 생략
+            return response_json({"comments": sliced, "last_comment_id": next_id})
+        except Exception as e2:
+            return response_json({"error": str(e2)}, 500)
 
 
 @transactional
@@ -558,7 +592,21 @@ def admin_accept_post(board_id, post_id):
     try:
         if not post_ref.get().exists:
             return response_json({"error": "Post not found"}, 404)
-        post_ref.update({"isAccept": bool(accept)})
+        update = {"isAccept": bool(accept)}
+        # 반려 시 대기목록에서 제외할 수 있도록 isRejected 마킹
+        if not bool(accept):
+            update.update(
+                {
+                    "isRejected": True,
+                    "rejected_at": datetime.now(timezone.utc)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                }
+            )
+        else:
+            # 승인 시 반려 플래그 초기화
+            update.update({"isRejected": firestore.DELETE_FIELD})
+        post_ref.update(update)
         return response_json({"post_id": post_id, "isAccept": bool(accept)})
     except Exception as e:
         return response_json({"error": str(e)}, 500)
@@ -586,7 +634,19 @@ def admin_accept_comment(board_id, post_id, comment_id):
     try:
         if not comment_ref.get().exists:
             return response_json({"error": "Comment not found"}, 404)
-        comment_ref.update({"isAccept": bool(accept)})
+        update = {"isAccept": bool(accept)}
+        if not bool(accept):
+            update.update(
+                {
+                    "isRejected": True,
+                    "rejected_at": datetime.now(timezone.utc)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                }
+            )
+        else:
+            update.update({"isRejected": firestore.DELETE_FIELD})
+        comment_ref.update(update)
         return response_json({"comment_id": comment_id, "isAccept": bool(accept)})
     except Exception as e:
         return response_json({"error": str(e)}, 500)
@@ -604,6 +664,9 @@ def admin_list_pending_posts(board_id):
         posts = []
         for doc in q.stream():
             d = doc.to_dict()
+            # 반려 처리된 글은 대기 목록에서 제외
+            if d.get("isRejected"):
+                continue
             d["id"] = doc.id
             posts.append(d)
         return response_json({"items": posts})
@@ -632,6 +695,8 @@ def admin_list_pending_comments(board_id, post_id):
         comments = []
         for doc in q.stream():
             d = doc.to_dict()
+            if d.get("isRejected"):
+                continue
             d["id"] = doc.id
             comments.append(d)
         return response_json({"items": comments})
