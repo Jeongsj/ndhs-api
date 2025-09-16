@@ -134,8 +134,6 @@ def create_post(board_id):
             "content": content,
             "user_id": user_id,
             "created_at": created_at,
-            # 태그 수신 시 저장 (프론트 글쓰기에서 전송)
-            "tag": (data.get("tag") or "").strip(),
             # 기본은 미승인 상태
             "isAccept": False,
         }
@@ -175,7 +173,11 @@ def get_posts(board_id):
         posts = []
         last_id = None
         for doc in docs:
-            posts.append({"id": doc.id, **doc.to_dict()})
+            d = {"id": doc.id, **doc.to_dict()}
+            if board_id != "notice":
+                # 게시판에서는 태그 사용 안함
+                d.pop("tag", None)
+            posts.append(d)
             last_id = doc.id
         return response_json({"posts": posts, "last": last_id})
     except Exception as e:
@@ -192,6 +194,8 @@ def get_post(board_id, post_id):
         doc = post_ref.get()
         if doc.exists:
             data = doc.to_dict()
+            if board_id != "notice":
+                data.pop("tag", None)
             # 승인 전 글도 반환하고 프론트에서 마스킹 처리
             return response_json({"posts": [data]})
         else:
@@ -700,6 +704,40 @@ def admin_list_pending_comments(board_id, post_id):
             d["id"] = doc.id
             comments.append(d)
         return response_json({"items": comments})
+    except Exception as e:
+        return response_json({"error": str(e)}, 500)
+
+
+@app.route("/admin/boards/<board_id>/comments/pending", methods=["GET"])
+def admin_list_all_pending_comments(board_id):
+    if not _require_admin():
+        return response_json({"error": "Forbidden"}, 403)
+    try:
+        # Query all comments across posts for this board using collection group
+        q = (
+            db.collection_group("comments")
+            .where("board_id", "==", board_id)
+            .where("isAccept", "==", False)
+        )
+        items = []
+        from datetime import datetime as _dt
+
+        def _parse(ts):
+            try:
+                return _dt.fromisoformat(ts.replace("Z", "+00:00")) if ts else _dt.min
+            except Exception:
+                return _dt.min
+
+        for doc in q.stream():
+            d = doc.to_dict()
+            if d.get("isRejected"):
+                continue
+            d["id"] = doc.id
+            items.append(d)
+
+        # Sort by created_at ascending for readability
+        items.sort(key=lambda x: _parse(x.get("created_at")))
+        return response_json({"items": items})
     except Exception as e:
         return response_json({"error": str(e)}, 500)
 
