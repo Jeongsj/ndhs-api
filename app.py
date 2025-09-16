@@ -82,6 +82,12 @@ def time_diff(time_str):
     return int(time_diff.total_seconds())
 
 
+def get_client_ip():
+    if "X-Forwarded-For" in request.headers:
+        return request.headers["X-Forwarded-For"]
+    return request.remote_addr
+
+
 # 게시물 작성 API
 @app.route("/boards/<board_id>", methods=["POST"])
 def create_post(board_id):
@@ -89,10 +95,7 @@ def create_post(board_id):
     title = (data.get("title") or "").strip()
     content = (data.get("content") or "").strip()
     user_id = (data.get("user_id") or "").strip()
-    if "X-Forwarded-For" in request.headers:
-        ip = request.headers["X-Forwarded-For"]
-    else:
-        ip = request.remote_addr
+    ip = get_client_ip()
 
     if not all([title, content]):
         return response_json({"error": "Missing required fields"}, 400)
@@ -113,6 +116,8 @@ def create_post(board_id):
             "tag": data.get("tag") or "",
             "no": data.get("no"),
             "ip": ip,
+            # 공지는 관리자만 작성 → 기본 승인 처리
+            "isAccept": True,
         }
     else:
         try:
@@ -129,6 +134,10 @@ def create_post(board_id):
             "content": content,
             "user_id": user_id,
             "created_at": created_at,
+            # 태그 수신 시 저장 (프론트 글쓰기에서 전송)
+            "tag": (data.get("tag") or "").strip(),
+            # 기본은 미승인 상태
+            "isAccept": False,
         }
 
     try:
@@ -151,9 +160,17 @@ def get_posts(board_id):
     last = request.args.get("last")
 
     posts_ref = db.collection("boards").document(board_id).collection("posts")
-    query = posts_ref.order_by(
-        "created_at", direction=firestore.Query.DESCENDING
-    ).limit(limit)
+    # 공지 이외의 게시판은 승인된 글만 노출
+    if board_id != "notice":
+        query = (
+            posts_ref.where("isAccept", "==", True)
+            .order_by("created_at", direction=firestore.Query.DESCENDING)
+            .limit(limit)
+        )
+    else:
+        query = posts_ref.order_by(
+            "created_at", direction=firestore.Query.DESCENDING
+        ).limit(limit)
 
     if last:
         last_doc = posts_ref.document(last).get()
@@ -181,7 +198,11 @@ def get_post(board_id, post_id):
     try:
         doc = post_ref.get()
         if doc.exists:
-            return response_json({"posts": [doc.to_dict()]})
+            data = doc.to_dict()
+            # 공지 외에는 승인된 글만 열람 가능
+            if board_id != "notice" and not data.get("isAccept"):
+                return response_json({"error": "Post not found"}, 404)
+            return response_json({"posts": [data]})
         else:
             return response_json({"error": "Post not found"}, 404)
     except Exception as e:
@@ -194,10 +215,7 @@ def add_comment(board_id, post_id):
     data = request.json
     content = (data.get("content") or "").strip()
     user_id = (data.get("user_id") or "").strip()
-    if "X-Forwarded-For" in request.headers:
-        ip = request.headers["X-Forwarded-For"]
-    else:
-        ip = request.remote_addr
+    ip = get_client_ip()
 
     if not all([content]):
         return response_json({"error": "Missing required field(s)"}, 400)
@@ -214,6 +232,8 @@ def add_comment(board_id, post_id):
         "user_id": user_id,
         "created_at": created_at,
         "ip": ip,
+        # 댓글도 기본 미승인
+        "isAccept": False,
     }
 
     try:
@@ -246,9 +266,12 @@ def get_comments(board_id, post_id):
         .document(post_id)
         .collection("comments")
     )
-    query = comments_ref.order_by(
-        "created_at", direction=firestore.Query.ASCENDING
-    ).limit(limit)
+    # 승인된 댓글만 노출
+    query = (
+        comments_ref.where("isAccept", "==", True)
+        .order_by("created_at", direction=firestore.Query.ASCENDING)
+        .limit(limit)
+    )
 
     if last_comment_id:
         last_doc = comments_ref.document(last_comment_id).get()
@@ -300,17 +323,20 @@ def apply_like_once(transaction, post_ref, ip):
 # 게시물 좋아요 API
 @app.route("/boards/<board_id>/<post_id>/like", methods=["POST"])
 def like_post(board_id, post_id):
-    if "X-Forwarded-For" in request.headers:
-        ip = request.headers["X-Forwarded-For"]
-    else:
-        ip = request.remote_addr
-
     post_ref = (
         db.collection("boards").document(board_id).collection("posts").document(post_id)
     )
 
     try:
+        # 승인된 글만 추천 가능 (공지 제외)
+        doc = post_ref.get()
+        if not doc.exists:
+            return response_json({"error": "Post not found"}, 404)
+        if board_id != "notice" and not (doc.to_dict().get("isAccept")):
+            return response_json({"error": "Not acceptable"}, 403)
+
         transaction = db.transaction()
+        ip = get_client_ip()
         result = apply_like_once(transaction, post_ref, ip)
         if result["status"] == "not_found":
             return response_json({"error": "Post not found"}, 404)
@@ -504,6 +530,113 @@ def get_laundry(sex):
 @app.route("/info/my", methods=["GET"])
 def get_info():
     return response_json({"outside": True, "room_id": "126"})
+
+
+# -----------------------------
+# Admin endpoints for moderation
+# -----------------------------
+
+
+def _require_admin():
+    token = request.headers.get("X-Admin-Token") or request.args.get("adminToken")
+    if not token or token != os.getenv("ADMIN_TOKEN"):
+        return False
+    return True
+
+
+@app.route("/admin/boards/<board_id>/<post_id>/accept", methods=["POST"])
+def admin_accept_post(board_id, post_id):
+    if not _require_admin():
+        return response_json({"error": "Forbidden"}, 403)
+    body = request.json or {}
+    accept = body.get("accept")
+    if accept is None:
+        accept = True
+    post_ref = (
+        db.collection("boards").document(board_id).collection("posts").document(post_id)
+    )
+    try:
+        if not post_ref.get().exists:
+            return response_json({"error": "Post not found"}, 404)
+        post_ref.update({"isAccept": bool(accept)})
+        return response_json({"post_id": post_id, "isAccept": bool(accept)})
+    except Exception as e:
+        return response_json({"error": str(e)}, 500)
+
+
+@app.route(
+    "/admin/boards/<board_id>/<post_id>/comments/<comment_id>/accept",
+    methods=["POST"],
+)
+def admin_accept_comment(board_id, post_id, comment_id):
+    if not _require_admin():
+        return response_json({"error": "Forbidden"}, 403)
+    body = request.json or {}
+    accept = body.get("accept")
+    if accept is None:
+        accept = True
+    comment_ref = (
+        db.collection("boards")
+        .document(board_id)
+        .collection("posts")
+        .document(post_id)
+        .collection("comments")
+        .document(comment_id)
+    )
+    try:
+        if not comment_ref.get().exists:
+            return response_json({"error": "Comment not found"}, 404)
+        comment_ref.update({"isAccept": bool(accept)})
+        return response_json({"comment_id": comment_id, "isAccept": bool(accept)})
+    except Exception as e:
+        return response_json({"error": str(e)}, 500)
+
+
+@app.route("/admin/boards/<board_id>/pending", methods=["GET"])
+def admin_list_pending_posts(board_id):
+    if not _require_admin():
+        return response_json({"error": "Forbidden"}, 403)
+    try:
+        posts_ref = db.collection("boards").document(board_id).collection("posts")
+        q = posts_ref.where("isAccept", "==", False).order_by(
+            "created_at", direction=firestore.Query.DESCENDING
+        )
+        posts = []
+        for doc in q.stream():
+            d = doc.to_dict()
+            d["id"] = doc.id
+            posts.append(d)
+        return response_json({"items": posts})
+    except Exception as e:
+        return response_json({"error": str(e)}, 500)
+
+
+@app.route(
+    "/admin/boards/<board_id>/<post_id>/comments/pending",
+    methods=["GET"],
+)
+def admin_list_pending_comments(board_id, post_id):
+    if not _require_admin():
+        return response_json({"error": "Forbidden"}, 403)
+    try:
+        comments_ref = (
+            db.collection("boards")
+            .document(board_id)
+            .collection("posts")
+            .document(post_id)
+            .collection("comments")
+        )
+        q = comments_ref.where("isAccept", "==", False).order_by(
+            "created_at", direction=firestore.Query.ASCENDING
+        )
+        comments = []
+        for doc in q.stream():
+            d = doc.to_dict()
+            d["id"] = doc.id
+            comments.append(d)
+        return response_json({"items": comments})
+    except Exception as e:
+        return response_json({"error": str(e)}, 500)
 
 
 if __name__ == "__main__":
