@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import requests
-from azure.cosmos import CosmosClient, MatchConditions, PartitionKey, exceptions
+from azure.cosmos import CosmosClient, PartitionKey, exceptions
 from dotenv import load_dotenv
 from flask import Flask, Response, request
 from flask_cors import CORS
@@ -67,8 +67,7 @@ def increment_post_id_counter(board_id):
             counters_container.replace_item(
                 item=board_id,
                 body=item,
-                etag=etag,
-                match_condition=MatchConditions.IfNotModified,
+                if_match=etag,
             )
             return str(item["count"])
         except exceptions.CosmosAccessConditionFailedError:
@@ -192,10 +191,11 @@ def create_post(board_id):
 def get_posts(board_id):
     limit = 10
     last = request.args.get("last")
+    last_created_at_param = request.args.get("last_created_at")
 
     # Keyset pagination by created_at DESC
-    last_created_at = None
-    if last:
+    last_created_at = last_created_at_param
+    if not last_created_at and last:
         try:
             last_item = posts_container.read_item(item=last, partition_key=board_id)
             last_created_at = last_item.get("created_at")
@@ -203,22 +203,21 @@ def get_posts(board_id):
             last_created_at = None
 
     params = [
-        {"name": "@board_id", "value": board_id},
         {"name": "@limit", "value": limit},
     ]
     if last_created_at:
         query = (
-            "SELECT TOP @limit c.id, c.post_id, c.board_id, c.title, c.content, c.user_id, "
-            "c.created_at, c.tag, c.no, c.ip, c.isAccept, c.likes, c.isRejected "
-            "FROM c WHERE c.board_id=@board_id AND c.created_at < @last_created_at "
+            "SELECT TOP @limit c.id, c.post_id, c.board_id, c.title, c.content, c.tag, c.no, c.user_id, "
+            "c.created_at, c.isAccept, c.likes "
+            "FROM c WHERE c.created_at < @last_created_at "
             "ORDER BY c.created_at DESC"
         )
         params.append({"name": "@last_created_at", "value": last_created_at})
     else:
         query = (
-            "SELECT TOP @limit c.id, c.post_id, c.board_id, c.title, c.content, c.user_id, "
-            "c.created_at, c.tag, c.no, c.ip, c.isAccept, c.likes, c.isRejected "
-            "FROM c WHERE c.board_id=@board_id ORDER BY c.created_at DESC"
+            "SELECT TOP @limit c.id, c.post_id, c.board_id, c.title, c.content, c.tag, c.no, c.user_id, "
+            "c.created_at, c.isAccept, c.likes "
+            "FROM c ORDER BY c.created_at DESC"
         )
 
     try:
@@ -231,15 +230,17 @@ def get_posts(board_id):
         )
         posts = []
         last_id = None
+        last_created_at_out = None
         for it in items:
-            d = dict(it)
             # Ensure id field exists
-            d.setdefault("id", d.get("post_id") or d.get("id"))
-            if board_id != "notice":
-                d.pop("tag", None)
-            posts.append(d)
-            last_id = d.get("id")
-        return response_json({"posts": posts, "last": last_id})
+            if "id" not in it:
+                it["id"] = it.get("post_id")
+            posts.append(it)
+            last_id = it.get("id")
+            last_created_at_out = it.get("created_at")
+        return response_json(
+            {"posts": posts, "last": last_id, "last_created_at": last_created_at_out}
+        )
     except Exception as e:
         return response_json({"error": str(e)}, 500)
 
@@ -344,7 +345,7 @@ def get_comments(board_id, post_id):
         # 인덱스 미구성 등으로 실패한 경우 폴백: 최대 N개 읽어 정렬/슬라이싱
         err = str(e)
         try:
-            fallback_limit = max(50, limit * 3)
+            fallback_limit = max(20, limit * 3)
             # Read more and sort client-side
             items_all = list(
                 comments_container.query_items(
@@ -434,8 +435,7 @@ def apply_like_once(post_id, board_id, ip):
             posts_container.replace_item(
                 item=post_id,
                 body=post_item,
-                etag=etag,
-                match_condition=MatchConditions.IfNotModified,
+                if_match=etag,
             )
             return {"status": "ok", "likes": post_item.get("likes", 0)}
         except exceptions.CosmosAccessConditionFailedError:
