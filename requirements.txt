@@ -3,6 +3,5 @@ flask-cors
 mangum
 python-dotenv
 asgiref
-google-cloud-firestore
-google-auth
+azure-cosmos
 requests

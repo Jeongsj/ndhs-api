@@ -16,9 +16,9 @@
 
 ## 페이징 처리
 
-- 목록 조회 시 쿼리 파라미터 `last` 또는 `last_comment_id`를 사용해 Firestore 커서 기반 페이징 지원
-- 첫 페이지 요청 시 쿼리 파라미터 없음 → 최신 게시물(댓글)부터 `limit` 개수 반환
-- 이후 페이지는 마지막 ID를 파라미터로 넣어 다음 페이지 조회
+- 목록 조회 시 쿼리 파라미터 `last` 또는 `last_comment_id` 사용
+- 첫 페이지: 파라미터 없음 → 최신순(게시물은 DESC, 댓글은 ASC) `limit` 개 반환
+- 다음 페이지: `last`(또는 `last_comment_id`) 아이템의 `created_at` 기준으로 키셋 페이지네이션
 
 ## 인증 및 보안
 
@@ -32,13 +32,21 @@
 
 ## 프로젝트 참고사항
 
-- Firestore 계층적 컬렉션 구조 사용 (`boards/{board_id}/posts/{post_id}`, `comments` 하위컬렉션)
-- 게시판별 글 ID 카운터 별도 트랜잭션으로 관리
-- `created_at` UTC ISO 8601 형식 타임스탬프 이용 정렬 및 페이징
-- Firestore 쿼리에서 승인 댓글/글 필터(`where('isAccept','==',true)`)와 정렬 조합을 사용합니다. 복합 인덱스가 필요할 경우 콘솔 안내에 따라 생성하세요.
+- Azure Cosmos DB for NoSQL 사용
+- 컨테이너 및 파티션키
+  - posts: 파티션키 `/board_id`, 문서 `id=post_id`
+  - comments: 파티션키 `/post_id`, 문서 `id=comment_id`
+  - counters: 파티션키 `/board_id`, 문서 `id=board_id` (게시판별 글번호 카운터)
+  - likes: 파티션키 `/post_id`, 문서 `id=ip` (게시물당 IP 1회 제한)
+- `created_at` UTC ISO 8601 문자열로 정렬/페이징
+- 기본 인덱싱으로 단일 속성 정렬(ORDER BY) 지원, 크로스 파티션 정렬은 사용하지 않음
 
 ## 개발 및 배포
 
-- `GOOGLE_APPLICATION_CREDENTIALS` 환경변수에 서비스 계정 파일 경로를 설정
-- `ADMIN_TOKEN` 환경변수에 관리자 토큰을 설정해 승인 API를 사용할 수 있습니다.
+- 환경변수
+  - `COSMOS_URI`: Cosmos DB 계정 URI
+  - `COSMOS_KEY`: Cosmos DB 계정 키(Primary Key)
+  - `COSMOS_DB_NAME`: 데이터베이스 이름(기본값 `ndhs`)
+  - `ADMIN_TOKEN`: 관리자 토큰
+  - `NOTICE_PW`: 공지 작성 비밀번호
 - AWS Lambda, Serverless Framework, GitHub Actions 등 다양한 환경에 맞게 확장 가능

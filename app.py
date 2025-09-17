@@ -5,12 +5,10 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import requests
+from azure.cosmos import CosmosClient, MatchConditions, PartitionKey, exceptions
 from dotenv import load_dotenv
 from flask import Flask, Response, request
 from flask_cors import CORS
-from google.cloud import firestore
-from google.cloud.firestore_v1.transaction import transactional
-from google.oauth2 import service_account
 
 load_dotenv()
 app = Flask(__name__)
@@ -19,25 +17,66 @@ CORS(
     origins=["https://ndhs.app"],
 )
 
-cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-credentials = service_account.Credentials.from_service_account_file(cred_path)
-db = firestore.Client(credentials=credentials)
+COSMOS_URI = os.getenv("COSMOS_URI")
+COSMOS_KEY = os.getenv("COSMOS_KEY")
+COSMOS_DB_NAME = os.getenv("COSMOS_DB_NAME", "ndhs")
+
+# Initialize Cosmos DB client and containers
+cosmos_client = CosmosClient(COSMOS_URI, credential=COSMOS_KEY)
+database = cosmos_client.create_database_if_not_exists(id=COSMOS_DB_NAME)
 
 
-@transactional
-def update_post_id_counter(transaction, counter_ref):
-    snapshot = counter_ref.get(transaction=transaction)
-    count = snapshot.get("count") if snapshot.exists else 0
-    count += 1
-    transaction.set(counter_ref, {"count": count})
-    return count
+def _get_or_create_container(id: str, pk_path: str):
+    try:
+        return database.create_container_if_not_exists(
+            id=id,
+            partition_key=PartitionKey(path=pk_path),
+        )
+    except Exception:
+        # If permissions or throughput configuration cause creation to fail, fall back to get_container_client
+        return database.get_container_client(id)
+
+
+posts_container = _get_or_create_container("posts", "/board_id")
+comments_container = _get_or_create_container("comments", "/post_id")
+counters_container = _get_or_create_container("counters", "/board_id")
+likes_container = _get_or_create_container("likes", "/post_id")
 
 
 def increment_post_id_counter(board_id):
-    counter_ref = db.collection("counters").document(board_id)
-    transaction = db.transaction()
-    new_post_id = update_post_id_counter(transaction, counter_ref)
-    return str(new_post_id)
+    """Atomically increment per-board post counter using optimistic concurrency (ETag)."""
+    # First try to create (new board)
+    try:
+        counters_container.create_item(
+            {
+                "id": board_id,
+                "board_id": board_id,
+                "count": 1,
+            }
+        )
+        return "1"
+    except exceptions.CosmosResourceExistsError:
+        pass
+
+    # Increment with retry on ETag conflicts
+    for _ in range(5):
+        try:
+            item = counters_container.read_item(item=board_id, partition_key=board_id)
+            etag = item.get("_etag")
+            item["count"] = (item.get("count") or 0) + 1
+            counters_container.replace_item(
+                item=board_id,
+                body=item,
+                etag=etag,
+                match_condition=MatchConditions.IfNotModified,
+            )
+            return str(item["count"])
+        except exceptions.CosmosAccessConditionFailedError:
+            # ETag mismatch, retry
+            continue
+        except exceptions.CosmosHttpResponseError as e:
+            raise e
+    raise RuntimeError("Failed to increment counter due to concurrent updates")
 
 
 def response_json(data, status=200):
@@ -134,18 +173,15 @@ def create_post(board_id):
             "content": content,
             "user_id": user_id,
             "created_at": created_at,
+            "ip": ip,
             # 기본은 미승인 상태
             "isAccept": False,
         }
 
     try:
-        post_ref = (
-            db.collection("boards")
-            .document(board_id)
-            .collection("posts")
-            .document(post_id)
-        )
-        post_ref.set(post_data)
+        # Cosmos: posts container, partition by board_id, id = post_id
+        post_item = {"id": post_id, **post_data}
+        posts_container.upsert_item(post_item)
         return response_json({"message": "Post created", "post_id": post_id}, 201)
     except Exception as e:
         return response_json({"error": str(e)}, 500)
@@ -157,28 +193,52 @@ def get_posts(board_id):
     limit = 10
     last = request.args.get("last")
 
-    posts_ref = db.collection("boards").document(board_id).collection("posts")
-    # 승인 여부와 관계없이 모두 반환(프론트에서 isAccept로 마스킹)
-    query = posts_ref.order_by(
-        "created_at", direction=firestore.Query.DESCENDING
-    ).limit(limit)
-
+    # Keyset pagination by created_at DESC
+    last_created_at = None
     if last:
-        last_doc = posts_ref.document(last).get()
-        if last_doc.exists:
-            query = query.start_after(last_doc)
+        try:
+            last_item = posts_container.read_item(item=last, partition_key=board_id)
+            last_created_at = last_item.get("created_at")
+        except exceptions.CosmosResourceNotFoundError:
+            last_created_at = None
+
+    params = [
+        {"name": "@board_id", "value": board_id},
+        {"name": "@limit", "value": limit},
+    ]
+    if last_created_at:
+        query = (
+            "SELECT TOP @limit c.id, c.post_id, c.board_id, c.title, c.content, c.user_id, "
+            "c.created_at, c.tag, c.no, c.ip, c.isAccept, c.likes, c.isRejected "
+            "FROM c WHERE c.board_id=@board_id AND c.created_at < @last_created_at "
+            "ORDER BY c.created_at DESC"
+        )
+        params.append({"name": "@last_created_at", "value": last_created_at})
+    else:
+        query = (
+            "SELECT TOP @limit c.id, c.post_id, c.board_id, c.title, c.content, c.user_id, "
+            "c.created_at, c.tag, c.no, c.ip, c.isAccept, c.likes, c.isRejected "
+            "FROM c WHERE c.board_id=@board_id ORDER BY c.created_at DESC"
+        )
 
     try:
-        docs = query.stream()
+        items = list(
+            posts_container.query_items(
+                query=query,
+                parameters=params,
+                partition_key=board_id,
+            )
+        )
         posts = []
         last_id = None
-        for doc in docs:
-            d = {"id": doc.id, **doc.to_dict()}
+        for it in items:
+            d = dict(it)
+            # Ensure id field exists
+            d.setdefault("id", d.get("post_id") or d.get("id"))
             if board_id != "notice":
-                # 게시판에서는 태그 사용 안함
                 d.pop("tag", None)
             posts.append(d)
-            last_id = doc.id
+            last_id = d.get("id")
         return response_json({"posts": posts, "last": last_id})
     except Exception as e:
         return response_json({"error": str(e)}, 500)
@@ -187,20 +247,13 @@ def get_posts(board_id):
 # 게시물 상세 조회 API
 @app.route("/boards/<board_id>/<post_id>", methods=["GET"])
 def get_post(board_id, post_id):
-    post_ref = (
-        db.collection("boards").document(board_id).collection("posts").document(post_id)
-    )
     try:
-        doc = post_ref.get()
-        if doc.exists:
-            data = doc.to_dict()
-            if board_id != "notice":
-                data.pop("tag", None)
-            # 승인 전 글도 반환하고 프론트에서 마스킹 처리
-            return response_json({"posts": [data]})
-        else:
-            return response_json({"error": "Post not found"}, 404)
+        item = posts_container.read_item(item=post_id, partition_key=board_id)
+        # 승인 전 글도 반환하고 프론트에서 마스킹 처리
+        return response_json({"posts": [item]})
     except Exception as e:
+        if isinstance(e, exceptions.CosmosResourceNotFoundError):
+            return response_json({"error": "Post not found"}, 404)
         return response_json({"error": str(e)}, 500)
 
 
@@ -232,15 +285,8 @@ def add_comment(board_id, post_id):
     }
 
     try:
-        comment_ref = (
-            db.collection("boards")
-            .document(board_id)
-            .collection("posts")
-            .document(post_id)
-            .collection("comments")
-            .document(comment_id)
-        )
-        comment_ref.set(comment_data)
+        comment_item = {"id": comment_id, **comment_data}
+        comments_container.upsert_item(comment_item)
         return response_json(
             {"message": "Comment added", "comment_id": comment_id}, 201
         )
@@ -254,46 +300,65 @@ def get_comments(board_id, post_id):
     limit = 10
     last_comment_id = request.args.get("last_comment_id")
 
-    comments_ref = (
-        db.collection("boards")
-        .document(board_id)
-        .collection("posts")
-        .document(post_id)
-        .collection("comments")
-    )
-    # 빈 컬렉션은 바로 처리 (인덱스 미구성 시에도 안전)
-    try:
-        first_doc = next(comments_ref.limit(1).stream(), None)
-        if first_doc is None:
-            return response_json({"comments": [], "last_comment_id": None})
-    except Exception as e:
-        # 예외적 상황에서도 안전 반환
-        return response_json({"comments": [], "last_comment_id": None})
-
+    # Empty collection quick check via count of top 1
     # 승인 여부와 관계없이 모두 반환 (프론트에서 마스킹)
-    query = comments_ref.order_by(
-        "created_at", direction=firestore.Query.ASCENDING
-    ).limit(limit)
-
+    last_created_at = None
     if last_comment_id:
-        last_doc = comments_ref.document(last_comment_id).get()
-        if last_doc.exists:
-            query = query.start_after(last_doc)
+        try:
+            last_item = comments_container.read_item(
+                item=last_comment_id, partition_key=post_id
+            )
+            last_created_at = last_item.get("created_at")
+        except exceptions.CosmosResourceNotFoundError:
+            last_created_at = None
+
+    params = [
+        {"name": "@post_id", "value": post_id},
+        {"name": "@limit", "value": limit},
+    ]
+    if last_created_at:
+        query = (
+            "SELECT TOP @limit c.id, c.comment_id, c.post_id, c.board_id, c.content, c.user_id, c.created_at, c.ip, c.isAccept, c.isRejected "
+            "FROM c WHERE c.post_id=@post_id AND c.created_at > @last_created_at ORDER BY c.created_at ASC"
+        )
+        params.append({"name": "@last_created_at", "value": last_created_at})
+    else:
+        query = (
+            "SELECT TOP @limit c.id, c.comment_id, c.post_id, c.board_id, c.content, c.user_id, c.created_at, c.ip, c.isAccept, c.isRejected "
+            "FROM c WHERE c.post_id=@post_id ORDER BY c.created_at ASC"
+        )
 
     try:
-        docs = query.stream()
+        items = list(
+            comments_container.query_items(
+                query=query, parameters=params, partition_key=post_id
+            )
+        )
         comments = []
         last_id = None
-        for doc in docs:
-            comments.append(doc.to_dict())
-            last_id = doc.id
+        for it in items:
+            comments.append(it)
+            last_id = it.get("id")
         return response_json({"comments": comments, "last_comment_id": last_id})
     except Exception as e:
         # 인덱스 미구성 등으로 실패한 경우 폴백: 최대 N개 읽어 정렬/슬라이싱
         err = str(e)
         try:
             fallback_limit = max(50, limit * 3)
-            docs = comments_ref.limit(fallback_limit).stream()
+            # Read more and sort client-side
+            items_all = list(
+                comments_container.query_items(
+                    query=(
+                        "SELECT TOP @limit c.id, c.comment_id, c.post_id, c.board_id, c.content, c.user_id, c.created_at, c.ip, c.isAccept, c.isRejected "
+                        "FROM c WHERE c.post_id=@post_id"
+                    ),
+                    parameters=[
+                        {"name": "@limit", "value": fallback_limit},
+                        {"name": "@post_id", "value": post_id},
+                    ],
+                    partition_key=post_id,
+                )
+            )
             items = []
             from datetime import datetime as _dt
 
@@ -309,12 +374,15 @@ def get_comments(board_id, post_id):
             # last cursor 기준시간
             last_created = None
             if last_comment_id:
-                last_doc = comments_ref.document(last_comment_id).get()
-                if last_doc.exists:
-                    last_created = _parse(last_doc.to_dict().get("created_at"))
+                try:
+                    last_doc = comments_container.read_item(
+                        item=last_comment_id, partition_key=post_id
+                    )
+                    last_created = _parse(last_doc.get("created_at"))
+                except exceptions.CosmosResourceNotFoundError:
+                    last_created = None
 
-            for d in docs:
-                data = d.to_dict()
+            for data in items_all:
                 ctime = _parse(data.get("created_at"))
                 if last_created and not (ctime > last_created):
                     continue
@@ -328,54 +396,70 @@ def get_comments(board_id, post_id):
             return response_json({"error": str(e2)}, 500)
 
 
-@transactional
-def apply_like_once(transaction, post_ref, ip):
+def apply_like_once(post_id, board_id, ip):
     """Transactionally record a like per IP and increment like counter.
 
     Returns a dict: {status: 'ok'|'already'|'not_found', likes: int|None}
     """
-    doc = post_ref.get(transaction=transaction)
-    if not doc.exists:
+    # 1) Ensure post exists
+    try:
+        post_item = posts_container.read_item(item=post_id, partition_key=board_id)
+    except exceptions.CosmosResourceNotFoundError:
         return {"status": "not_found", "likes": None}
 
-    like_ref = post_ref.collection("likes").document(ip)
-    like_doc = like_ref.get(transaction=transaction)
-    if like_doc.exists:
-        current_likes = doc.to_dict().get("likes") or 0
+    # 2) Create like record if not exists (partitioned by post_id)
+    try:
+        likes_container.create_item(
+            {
+                "id": ip,
+                "post_id": post_id,
+                "board_id": board_id,
+                "ip": ip,
+                "created_at": datetime.now(timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
+            }
+        )
+    except exceptions.CosmosResourceExistsError:
+        current_likes = post_item.get("likes") or 0
         return {"status": "already", "likes": current_likes}
 
-    # Record like by IP and increment counter atomically
-    transaction.set(
-        like_ref,
-        {
-            "ip": ip,
-            "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        },
-    )
-    transaction.update(post_ref, {"likes": firestore.Increment(1)})
-
-    new_likes = (doc.to_dict().get("likes") or 0) + 1
-    return {"status": "ok", "likes": new_likes}
+    # 3) Optimistically increment likes on post with ETag retry
+    for _ in range(5):
+        try:
+            # refresh
+            post_item = posts_container.read_item(item=post_id, partition_key=board_id)
+            etag = post_item.get("_etag")
+            post_item["likes"] = (post_item.get("likes") or 0) + 1
+            posts_container.replace_item(
+                item=post_id,
+                body=post_item,
+                etag=etag,
+                match_condition=MatchConditions.IfNotModified,
+            )
+            return {"status": "ok", "likes": post_item.get("likes", 0)}
+        except exceptions.CosmosAccessConditionFailedError:
+            continue
+    # If we failed to increment due to contention, just return current count
+    post_item = posts_container.read_item(item=post_id, partition_key=board_id)
+    return {"status": "ok", "likes": post_item.get("likes") or 0}
 
 
 # 게시물 좋아요 API
 @app.route("/boards/<board_id>/<post_id>/like", methods=["POST"])
 def like_post(board_id, post_id):
-    post_ref = (
-        db.collection("boards").document(board_id).collection("posts").document(post_id)
-    )
-
     try:
         # 승인된 글만 추천 가능 (공지 제외)
-        doc = post_ref.get()
-        if not doc.exists:
+        try:
+            post_item = posts_container.read_item(item=post_id, partition_key=board_id)
+        except exceptions.CosmosResourceNotFoundError:
             return response_json({"error": "Post not found"}, 404)
-        if board_id != "notice" and not (doc.to_dict().get("isAccept")):
+
+        if board_id != "notice" and not (post_item.get("isAccept")):
             return response_json({"error": "Not acceptable"}, 403)
 
-        transaction = db.transaction()
         ip = get_client_ip()
-        result = apply_like_once(transaction, post_ref, ip)
+        result = apply_like_once(post_id, board_id, ip)
         if result["status"] == "not_found":
             return response_json({"error": "Post not found"}, 404)
 
@@ -590,27 +674,23 @@ def admin_accept_post(board_id, post_id):
     accept = body.get("accept")
     if accept is None:
         accept = True
-    post_ref = (
-        db.collection("boards").document(board_id).collection("posts").document(post_id)
-    )
     try:
-        if not post_ref.get().exists:
+        try:
+            post_item = posts_container.read_item(item=post_id, partition_key=board_id)
+        except exceptions.CosmosResourceNotFoundError:
             return response_json({"error": "Post not found"}, 404)
-        update = {"isAccept": bool(accept)}
-        # 반려 시 대기목록에서 제외할 수 있도록 isRejected 마킹
+        # apply update
+        post_item["isAccept"] = bool(accept)
         if not bool(accept):
-            update.update(
-                {
-                    "isRejected": True,
-                    "rejected_at": datetime.now(timezone.utc)
-                    .isoformat()
-                    .replace("+00:00", "Z"),
-                }
+            post_item["isRejected"] = True
+            post_item["rejected_at"] = (
+                datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             )
         else:
-            # 승인 시 반려 플래그 초기화
-            update.update({"isRejected": firestore.DELETE_FIELD})
-        post_ref.update(update)
+            # remove isRejected flags if exist
+            post_item.pop("isRejected", None)
+            post_item.pop("rejected_at", None)
+        posts_container.replace_item(item=post_id, body=post_item)
         return response_json({"post_id": post_id, "isAccept": bool(accept)})
     except Exception as e:
         return response_json({"error": str(e)}, 500)
@@ -627,30 +707,23 @@ def admin_accept_comment(board_id, post_id, comment_id):
     accept = body.get("accept")
     if accept is None:
         accept = True
-    comment_ref = (
-        db.collection("boards")
-        .document(board_id)
-        .collection("posts")
-        .document(post_id)
-        .collection("comments")
-        .document(comment_id)
-    )
     try:
-        if not comment_ref.get().exists:
+        try:
+            c_item = comments_container.read_item(
+                item=comment_id, partition_key=post_id
+            )
+        except exceptions.CosmosResourceNotFoundError:
             return response_json({"error": "Comment not found"}, 404)
-        update = {"isAccept": bool(accept)}
+        c_item["isAccept"] = bool(accept)
         if not bool(accept):
-            update.update(
-                {
-                    "isRejected": True,
-                    "rejected_at": datetime.now(timezone.utc)
-                    .isoformat()
-                    .replace("+00:00", "Z"),
-                }
+            c_item["isRejected"] = True
+            c_item["rejected_at"] = (
+                datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             )
         else:
-            update.update({"isRejected": firestore.DELETE_FIELD})
-        comment_ref.update(update)
+            c_item.pop("isRejected", None)
+            c_item.pop("rejected_at", None)
+        comments_container.replace_item(item=comment_id, body=c_item)
         return response_json({"comment_id": comment_id, "isAccept": bool(accept)})
     except Exception as e:
         return response_json({"error": str(e)}, 500)
@@ -661,17 +734,23 @@ def admin_list_pending_posts(board_id):
     if not _require_admin():
         return response_json({"error": "Forbidden"}, 403)
     try:
-        posts_ref = db.collection("boards").document(board_id).collection("posts")
-        q = posts_ref.where("isAccept", "==", False).order_by(
-            "created_at", direction=firestore.Query.DESCENDING
+        query = (
+            "SELECT c.id, c.post_id, c.board_id, c.title, c.content, c.user_id, c.created_at, c.tag, c.no, c.ip, c.isAccept, c.likes, c.isRejected "
+            "FROM c WHERE c.board_id=@board_id AND c.isAccept=false "
+            "AND (NOT IS_DEFINED(c.isRejected) OR c.isRejected=false) "
+            "ORDER BY c.created_at DESC"
+        )
+        items = list(
+            posts_container.query_items(
+                query=query,
+                parameters=[{"name": "@board_id", "value": board_id}],
+                partition_key=board_id,
+            )
         )
         posts = []
-        for doc in q.stream():
-            d = doc.to_dict()
-            # 반려 처리된 글은 대기 목록에서 제외
-            if d.get("isRejected"):
-                continue
-            d["id"] = doc.id
+        for it in items:
+            d = dict(it)
+            d.setdefault("id", d.get("post_id") or d.get("id"))
             posts.append(d)
         return response_json({"items": posts})
     except Exception as e:
@@ -686,22 +765,21 @@ def admin_list_pending_comments(board_id, post_id):
     if not _require_admin():
         return response_json({"error": "Forbidden"}, 403)
     try:
-        comments_ref = (
-            db.collection("boards")
-            .document(board_id)
-            .collection("posts")
-            .document(post_id)
-            .collection("comments")
+        query = (
+            "SELECT c.id, c.comment_id, c.post_id, c.board_id, c.content, c.user_id, c.created_at, c.ip, c.isAccept, c.isRejected "
+            "FROM c WHERE c.post_id=@post_id AND c.isAccept=false AND (NOT IS_DEFINED(c.isRejected) OR c.isRejected=false) "
+            "ORDER BY c.created_at ASC"
         )
-        q = comments_ref.where("isAccept", "==", False).order_by(
-            "created_at", direction=firestore.Query.ASCENDING
+        items = list(
+            comments_container.query_items(
+                query=query,
+                parameters=[{"name": "@post_id", "value": post_id}],
+                partition_key=post_id,
+            )
         )
         comments = []
-        for doc in q.stream():
-            d = doc.to_dict()
-            if d.get("isRejected"):
-                continue
-            d["id"] = doc.id
+        for it in items:
+            d = dict(it)
             comments.append(d)
         return response_json({"items": comments})
     except Exception as e:
@@ -713,13 +791,18 @@ def admin_list_all_pending_comments(board_id):
     if not _require_admin():
         return response_json({"error": "Forbidden"}, 403)
     try:
-        # Query all comments across posts for this board using collection group
-        q = (
-            db.collection_group("comments")
-            .where("board_id", "==", board_id)
-            .where("isAccept", "==", False)
+        # Cross-partition query across comments by board_id
+        query = (
+            "SELECT c.id, c.comment_id, c.post_id, c.board_id, c.content, c.user_id, c.created_at, c.ip, c.isAccept, c.isRejected "
+            "FROM c WHERE c.board_id=@board_id AND c.isAccept=false AND (NOT IS_DEFINED(c.isRejected) OR c.isRejected=false)"
         )
-        items = []
+        items = list(
+            comments_container.query_items(
+                query=query,
+                parameters=[{"name": "@board_id", "value": board_id}],
+                enable_cross_partition_query=True,
+            )
+        )
         from datetime import datetime as _dt
 
         def _parse(ts):
@@ -728,14 +811,7 @@ def admin_list_all_pending_comments(board_id):
             except Exception:
                 return _dt.min
 
-        for doc in q.stream():
-            d = doc.to_dict()
-            if d.get("isRejected"):
-                continue
-            d["id"] = doc.id
-            items.append(d)
-
-        # Sort by created_at ascending for readability
+        items = [d for d in items if not d.get("isRejected")]
         items.sort(key=lambda x: _parse(x.get("created_at")))
         return response_json({"items": items})
     except Exception as e:
