@@ -210,14 +210,14 @@ def get_posts(board_id):
             "SELECT TOP @limit c.id, c.post_id, c.board_id, c.title, c.content, c.tag, c.no, c.user_id, "
             "c.created_at, c.isAccept, c.likes "
             "FROM c WHERE c.created_at < @last_created_at "
-            "ORDER BY c.created_at DESC"
+            "ORDER BY c.id DESC"
         )
         params.append({"name": "@last_created_at", "value": last_created_at})
     else:
         query = (
             "SELECT TOP @limit c.id, c.post_id, c.board_id, c.title, c.content, c.tag, c.no, c.user_id, "
             "c.created_at, c.isAccept, c.likes "
-            "FROM c ORDER BY c.created_at DESC"
+            "FROM c ORDER BY c.id DESC"
         )
 
     try:
